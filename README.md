@@ -84,3 +84,8 @@ Everything is controlled from `config.py`, and can be overridden with environmen
 - IMAGE_BACKEND, none (default), resnet, or clip
 - NUMERIC_WEIGHT, IMAGE_WEIGHT how much each part counts in the combined score
 
+## Examples
+<img src="examples/example-1.png" width="700">
+<img src="examples/example-2.png" width="700">
+<img src="examples/example-3.png" width="700">
+
