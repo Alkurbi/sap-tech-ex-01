@@ -3,7 +3,7 @@
 A service that finds similar products in the Amazon India fashion dataset (~30,000 items).
 Given a product ID, it returns the N most similar product IDs.
 
-It combines three kinds of signal — text, numeric, and image — into a single similarity
+It combines three kinds of signal; text, numeric, and image into a single similarity
 score with configurable weights, and falls back gracefully when a signal is missing. It
 also includes an approximate nearest-neighbour index (HNSW) so search stays fast on the
 full dataset.
@@ -16,17 +16,6 @@ Each product is turned into vectors:
   string and turned into a vector with TF-IDF + SVD (or, optionally, transformer embeddings).
 - numeric: log(sales_price) and rating, standardized.
 - image: features from the product image using CLIP or ResNet (optional).
-
-To compare two products, I compute a cosine similarity for each part separately and then
-take a weighted average of those scores. This is called late fusion. If a product has no
-usable image, the image part is dropped and the remaining weights are renormalized, so the
-product is still scored fairly on the signals it does have.
-
-For speed, the parts are also concatenated into a single vector and indexed with HNSW. A
-query first pulls a small set of candidates from the index, and then those candidates are
-re-scored with the weighted late-fusion score. This keeps the fast index lookup while still
-applying the per-query weights and fallback.
-
 
 ## Setup
 
