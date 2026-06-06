@@ -1,26 +1,12 @@
-import os
-from contextlib import asynccontextmanager
 from typing import Annotated
 
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel
 
-from product_similarity import ann, config
-
-
-def _ready():
-    has_index = os.path.exists(os.path.join(config.EMBED_DIR, "hnsw.bin"))
-    ann.init(rebuild=not has_index)
-
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    _ready()
-    yield
+from product_similarity import ann
 
 
 app = FastAPI(title="Product Similarity Search")
-
 
 class SimilarProductsResponse(BaseModel):
     product_id: str
