@@ -1,162 +1,191 @@
 # Product Similarity Search
 
-Given a product's `uniq_id`, return the most similar products from a ~30k Amazon India
-fashion catalogue. The similarity is content-based, combining text, category, numeric,
-and (optionally) image signals.
+A service that finds similar products in the Amazon India fashion dataset (~30,000 items).
+Given a product ID, it returns the `N` most similar product IDs.
 
-## What's here
+It combines three kinds of signal — text, numeric, and image — into a single similarity
+score with configurable weights, and falls back gracefully when a signal is missing. It
+also includes an approximate nearest-neighbour index (HNSW) so search stays fast on the
+full dataset.
 
-- **Part 1** — `find_similar_products(product_id, num_similar)` (`src/product_similarity/search.py`).
-- **Part 2** — FastAPI microservice (`api/main.py`) + Docker + Kubernetes.
-- **Part 3 (bonus)** — HNSW approximate nearest-neighbour search (`src/product_similarity/ann.py`).
-- **Multimodal (optional)** — text + image similarity with configurable weighting and a
-  fallback for products missing a modality.
+## How it works
 
-## Quick start
+Each product is turned into vectors:
 
-```bash
-pip install -r requirements-light.txt    # torch-free default
-pip install -e .                          # installs the product_similarity package
+- text: product name, meta keywords, brand, category, and colour, combined into one
+  string and turned into a vector with TF-IDF + SVD (or, optionally, transformer embeddings).
+- numeric: `log(sales_price)` and `rating`, standardized.
+- image: features from the product image using CLIP or ResNet (optional).
 
-# place the dataset in data/, then:
-python -m product_similarity.clean --raw data/<dataset>.ldjson      # -> data/products_clean.parquet
-python -c "from product_similarity import ann; ann.init(rebuild=True)"   # -> embeddings/
-uvicorn api.main:app --host 0.0.0.0 --port 8000                     # serve on :8000
+To compare two products, I compute a cosine similarity for each part separately and then
+take a weighted average of those scores. This is called late fusion. If a product has no
+usable image, the image part is dropped and the remaining weights are renormalized, so the
+product is still scored fairly on the signals it does have.
+
+For speed, the parts are also concatenated into a single vector and indexed with HNSW. A
+query first pulls a small set of candidates from the index, and then those candidates are
+re-scored with the weighted late-fusion score. This keeps the fast index lookup while still
+applying the per-query weights and fallback.
+
+## Project layout
+
+```
+product_similarity/      core package
+  config.py              settings (backends, weights, file paths)
+  clean.py               raw .ldjson  ->  tidy parquet
+  features.py            builds text / numeric / image vectors, fuses them
+  image_features.py      downloads images and embeds them (ResNet / CLIP)
+  search.py              Part 1: exact search over all products
+  ann.py                 Part 3: HNSW index + re-rank (the main search path)
+api/
+  app.py                 FastAPI service
+k8s/                     Kubernetes deployment + service manifests
+Dockerfile               lightweight image (TF-IDF, no torch)
+Dockerfile.full          full image (transformer text + CLIP images)
+requirements.txt         dependencies for the lightweight build
+requirements-full.txt    extra dependencies for the full build
+data/                    dataset + generated files (gitignored)
 ```
 
-Query the service:
+## Setup
+
+Requires Python 3.12.
 
 ```bash
-curl "http://localhost:8000/find_similar_products?product_id=<uniq_id>&num_similar=5"
+pip install -r requirements.txt
 ```
 
-Docker (light image):
+Place the dataset in the `data/` folder:
+
+```
+data/marketing_sample_for_amazon_com-amazon_fashion_products__20200201_20200430__30k_data.ldjson
+```
+
+## Running it
+
+All commands are run from the repository root.
+
+1. Clean the raw data into a parquet file:
+
+```bash
+python -m product_similarity.clean --raw "data/marketing_sample_for_amazon_com-amazon_fashion_products__20200201_20200430__30k_data.ldjson"
+```
+
+2. Build the search index:
+
+```bash
+python -m product_similarity.ann
+```
+
+This also runs a small demo query and a benchmark comparing the fast (ANN) results against
+exact search.
+
+By default the text backend is TF-IDF. The image backend is controlled by the
+`IMAGE_BACKEND` environment variable. For a quick, lightweight run without downloading
+images or installing torch, set it to `none`:
+
+```bash
+# Windows
+set IMAGE_BACKEND=none
+# macOS / Linux
+export IMAGE_BACKEND=none
+```
+
+## API
+
+Start the service:
+
+```bash
+uvicorn api.app:app --host 0.0.0.0 --port 8000
+```
+
+Then query it:
+
+```
+GET /find_similar_products?product_id=<id>&num_similar=5
+```
+
+It returns a list of similar product IDs. A health check is available at `/health`.
+
+## Docker and Kubernetes
+
+Lightweight image (TF-IDF, no torch):
 
 ```bash
 docker build -t product-similarity .
 docker run -p 8000:8000 product-similarity
 ```
 
-Kubernetes:
+The full multimodal image (transformer text + CLIP images) is built from `Dockerfile.full`.
+It is much larger and expects the image embeddings to be generated locally first, so it
+does not download thousands of images during the build.
+
+Kubernetes manifests are in `k8s/`. Deploying to a live cluster was optional in the brief;
+the manifests are provided and can be applied with:
 
 ```bash
 kubectl apply -f k8s/
 ```
 
-## Project structure
-
-```
-.
-├── src/product_similarity/      # core library
-│   ├── config.py                # backend + weight + path switchboard
-│   ├── clean.py                 # raw .ldjson -> data/products_clean.parquet
-│   ├── features.py              # per-modality matrices + fusion
-│   ├── image_features.py        # optional ResNet/CLIP embeddings (cached)
-│   ├── search.py                # Part 1: exact late-fusion (recall reference)
-│   └── ann.py                   # Part 3: HNSW retrieve + late-fusion re-rank
-├── api/
-│   └── main.py                  # Part 2: FastAPI service
-├── scripts/
-│   ├── gen_gallery.py           # build a visual HTML gallery of results
-│   └── examples_image.py        # image-backend variations (run locally)
-├── notebooks/
-│   ├── eda.ipynb                # data exploration + findings
-│   └── examples.ipynb           # variations + trade-offs
-├── data/                        # raw dataset + cleaned parquet  (gitignored)
-│   ├── <dataset>.ldjson         # raw input (you provide)
-│   └── products_clean.parquet   # generated by clean.py
-├── embeddings/                  # pre-calculated matrices + index  (gitignored)
-│   ├── mats.npz, index.pkl      # feature matrices + ids
-│   ├── hnsw.bin                 # ANN index
-│   └── img_cache/, img_emb_*.npz # image downloads + embeddings (optional)
-├── k8s/                         # deployment + service manifests
-├── Dockerfile / Dockerfile.full # light (torch-free) / full (torch)
-├── pyproject.toml
-├── requirements-light.txt       # sklearn + hnswlib + fastapi
-└── requirements.txt             # + torch, torchvision, sentence-transformers
-```
-
-`data/` (raw + cleaned) and `embeddings/` (pre-calculated index) are gitignored. Both
-locations are configurable via `DATA_DIR` / `EMBED_DIR`.
-
-## Approach
-
-### Data comes first
-
-The single most important finding is that the dataset does not match the attribute list
-in the brief, so the design follows the data rather than the spec:
-
-- There is **no `price`** column. `sales_price` (~90% present) is the price signal.
-- **`weight` is ~79% a `999999999` sentinel** — its true coverage is ~20%. A null-rate
-  check alone would have missed this; the value distribution exposes it.
-- **`rating` is a genuine 1–5 scale** with no `0.0` placeholder — a reliable numeric.
-- `colour` (~20%) and `weight` (~20%) are sparse fallbacks; `brand` (~73%) is usable;
-  `product_name`, `meta_keywords`, the image URL, and the category path are ~100% present.
-- The category lives in a dict whose last key is a fine-grained leaf (e.g.
-  "WomensKurtasKurtis"), used as a cross-category guard.
-
-Because the reliable signal is text and category, the system is **text-and-category
-first** and degrades gracefully when other attributes are missing. See `notebooks/eda.ipynb`.
-
-### Features
-
-Each modality becomes its own L2-normalized matrix: text (`product_name + meta_keywords
-+ brand + category + colour` → TF-IDF + TruncatedSVD, or a sentence-transformer),
-numeric (`log(sales_price)` + `rating`, standardized), and optional image (ResNet or
-CLIP). Backends are selected via `config.py` / env vars.
-
-### Similarity and ANN
-
-The combined score is **late fusion** — per-modality cosine scores blended with
-configurable weights, dropping any modality a product lacks and renormalizing (the
-fallback). `search.py` computes this exactly; `ann.py` is the primary path: HNSW
-retrieves candidates, then late fusion re-ranks them — ANN speed with the combined
-scoring preserved.
-
-HNSW (Malkov & Yashunin, 2016) over the fused space. On the real 30k catalogue:
-**recall@10 = 0.994** versus exact, **~15–25× faster**. Chosen over FAISS (GPU/
-billion-scale) and Annoy (rebuilds to insert); `hnswlib` is also torch-free.
-
-### Deployment
-
-Two images trade quality against size: `Dockerfile` (light, torch-free, TF-IDF) and
-`Dockerfile.full` (adds torch for embedding/ResNet/CLIP). Artifacts are built at
-image-build time, so the container starts fast. The k8s manifests run 2 replicas with
-`/health` readiness/liveness probes.
-
 ## Configuration
 
-All env-overridable (see `src/product_similarity/config.py`):
+Everything is controlled from `config.py`, and can be overridden with environment variables:
 
-| Variable | Default | Meaning |
-|----------|---------|---------|
-| `TEXT_BACKEND` | `tfidf` | `tfidf` (light) or `embedding` (transformer) |
-| `IMAGE_BACKEND` | `none` | `none`, `resnet`, or `clip` |
-| `NUMERIC_WEIGHT` | `0.3` | numeric block weight in fusion |
-| `IMAGE_WEIGHT` | `0.5` | image block weight in fusion |
-| `TEXT_MODEL` | `all-MiniLM-L6-v2` | sentence-transformer model |
-| `CLIP_MODEL` | `clip-ViT-B-32` | CLIP model |
-| `DATA_DIR` | `data` | dataset + cleaned parquet location |
-| `EMBED_DIR` | `embeddings` | pre-calculated matrices + index location |
+- `TEXT_BACKEND` — `tfidf` (default) or `embedding`
+- `IMAGE_BACKEND` — `none`, `resnet`, or `clip` (default)
+- `NUMERIC_WEIGHT`, `IMAGE_WEIGHT` — how much each part counts in the combined score
 
-```bash
-TEXT_BACKEND=embedding IMAGE_BACKEND=clip python -c "from product_similarity import ann; ann.init(rebuild=True)"
-```
+Weights can also be passed per request to `find_similar_products`, so the balance can be
+tuned without rebuilding anything.
 
-## Trade-offs and limitations
+## Design decisions and trade-offs
 
-- Numeric similarity uses cosine on the 2-D block, capturing the price-vs-rating
-  *direction* more than magnitude proximity (consistent both sides; Euclidean would fit
-  "similar price" more strictly).
-- The ANN candidate set is built from the configured weights, so a very large query-time
-  reweighting could miss a few candidates; the wide candidate pool (~200) keeps this a
-  non-issue for normal tuning.
-- The deep backends (embedding / ResNet / CLIP) are verified by structure, not run in the
-  build environment (no access to model-weight hosts or the image CDN there); the TF-IDF
-  path is fully exercised. Run a local sanity check before relying on them.
+Late fusion over early fusion. The scores from text, numeric, and image are combined at
+query time rather than baking the modalities into one vector up front. This makes the
+weights tunable per request and makes the missing-image fallback simple — a missing modality
+is just dropped from the weighted average. Early fusion is still used to build the single
+vector the HNSW index needs.
 
-## Possible extensions
+HNSW for the nearest-neighbour bonus. I used HNSW (`hnswlib`), following Malkov & Yashunin,
+2016. It gives a strong recall/latency trade-off at this scale, supports incremental inserts,
+and is a small, torch-free dependency. FAISS is aimed at much larger / GPU workloads, and
+Annoy needs a full rebuild to add items. The index is used in a retrieve-then-rerank pattern:
+HNSW returns candidates quickly, then they are re-scored with the full weighted score.
 
-- Query by raw attributes (not just an existing `product_id`) using the persisted scaler.
-- Per-modality ANN indices to keep query-time weighting fully flexible at scale.
-- Learned modality weights instead of hand-set ones.
+Text and category are the strongest signal. The dataset's text fields (name, keywords, brand,
+category) are almost always present, so the system is text-and-category-first, with numeric
+and image as supporting signals.
+
+Weight is retrieved but not used in the similarity. About 79% of the `weight` values are a
+`999999999` placeholder, and weight is a weak similarity signal for clothing compared to
+category and description. It is still retrieved with the product's attributes, but left out of
+the score. The brief allows choosing which attributes to use, so this is a deliberate,
+data-driven choice.
+
+Tie-breaking. When two products have the same similarity score, the tie is broken by rating,
+then by sales price.
+
+Caching. Images are cached on disk by URL, and the computed image embeddings are cached too,
+so rebuilds don't re-download or re-embed unless the data or backend changes.
+
+## Notes on the data
+
+A few things in the data shaped the design:
+
+- There is no `price` column; `sales_price` is used as the price.
+- The category field is a dictionary; the first key is the broad category and the last key is
+  the most specific one, so both are parsed out.
+- The image field can contain several URLs separated by `|`; only the first is used.
+- Missing values are kept as missing during cleaning rather than filled in, so each feature
+  can decide how to handle its own gaps.
+
+## What maps to each part of the brief
+
+- Part 1 (similarity function): `find_similar_products` in `search.py` (exact) and `ann.py`
+  (indexed). It retrieves the product's attributes, scores it against the others with cosine
+  similarity, sorts, and returns the top `N`.
+- Part 2 (microservice): `api/app.py` (FastAPI, `GET /find_similar_products`) with the
+  `Dockerfile` and `k8s/` manifests.
+- Part 3 (bonus, vector search): HNSW index in `ann.py`.
+- Optional multimodal: text + image features combined by score with configurable weights and a
+  fallback, in `features.py`, `image_features.py`, `search.py`, and `ann.py`.
