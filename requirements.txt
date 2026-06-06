@@ -1,0 +1,11 @@
+pandas
+scikit-learn
+pyarrow
+hnswlib
+fastapi[standard]
+
+## uncomment if you intend to use clip and text embeddings.
+# sentence-transformers
+# torch
+# torchvision
+# pillow
